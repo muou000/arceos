@@ -27,7 +27,7 @@
 
 #![cfg_attr(not(test), no_std)]
 #![feature(doc_cfg)]
-#![feature(doc_auto_cfg)]
+#![feature(doc_cfg)]
 #![feature(linkage)]
 
 #[cfg(test)]
