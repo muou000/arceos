@@ -123,7 +123,7 @@ impl TaskInner {
         let tls = VirtAddr::from(0);
 
         t.entry = Some(Box::into_raw(Box::new(entry)));
-        t.ctx_mut().init(task_entry as usize, kstack.top(), tls);
+        t.ctx_mut().init(task_entry as *const () as usize, kstack.top(), tls);
         t.kstack = Some(kstack);
         if t.name == "idle" {
             t.is_idle = true;
