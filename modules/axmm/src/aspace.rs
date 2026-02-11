@@ -52,7 +52,7 @@ impl AddrSpace {
     }
 
     /// Creates a new empty address space.
-    pub(crate) fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
+    pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
         Ok(Self {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
