@@ -16,9 +16,10 @@ procfs = ["dep:axfs_ramfs"]
 sysfs = ["dep:axfs_ramfs"]
 fatfs = ["dep:fatfs"]
 myfs = ["dep:crate_interface"]
+ext4fs = ["dep:ext4_rs"]
 use-ramdisk = []
 
-default = ["devfs", "ramfs", "fatfs", "procfs", "sysfs"]
+default = ["devfs", "ramfs", "ext4fs", "procfs", "sysfs"]
 
 [dependencies]
 log = "=0.4.21"
@@ -30,6 +31,7 @@ axerrno = "0.1"
 axfs_vfs = "0.1"
 axfs_devfs = { version = "0.1", optional = true }
 axfs_ramfs = { version = "0.1", optional = true }
+ext4_rs = {version = "1.3.3", optional = true }
 crate_interface = { version = "0.1", optional = true }
 axsync = { workspace = true }
 axdriver = { workspace = true, features = ["block"] }

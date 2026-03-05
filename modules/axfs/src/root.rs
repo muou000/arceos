@@ -59,7 +59,8 @@ impl RootDirectory {
             return ax_err!(InvalidInput, "mount point already exists");
         }
         // create the mount point in the main filesystem if it does not exist
-        self.main_fs.root_dir().create(path, FileType::Dir)?;
+        // ignore the error if it already exists
+        let _ = self.main_fs.root_dir().create(path, FileType::Dir);
         fs.mount(path, self.main_fs.root_dir().lookup(path)?)?;
         self.mounts.push(MountPoint::new(path, fs));
         Ok(())
@@ -155,6 +156,11 @@ pub(crate) fn init_rootfs(disk: crate::dev::Disk) {
             FAT_FS.init_once(Arc::new(fs::fatfs::FatFileSystem::new(disk)));
             FAT_FS.init();
             let main_fs = FAT_FS.clone();
+        } else if #[cfg(feature = "ext4fs")] {
+            static EXT4_FS: LazyInit<Arc<fs::ext4fs::Ext4FileSystem>> = LazyInit::new();
+            EXT4_FS.init_once(Arc::new(fs::ext4fs::Ext4FileSystem::new(disk)));
+            EXT4_FS.init();
+            let main_fs = EXT4_FS.clone();
         }
     }
 
