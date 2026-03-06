@@ -21,11 +21,13 @@ impl Disk {
     }
 
     /// Get the size of the disk.
+    #[allow(dead_code)]
     pub fn size(&self) -> u64 {
         self.dev.num_blocks() * BLOCK_SIZE as u64
     }
 
     /// Get the position of the cursor.
+    #[allow(dead_code)]
     pub fn position(&self) -> u64 {
         self.block_id * BLOCK_SIZE as u64 + self.offset as u64
     }
