@@ -2,21 +2,23 @@ use alloc::sync::Arc;
 use core::ffi::{c_char, c_int};
 
 use axerrno::{LinuxError, LinuxResult};
-use axfs::fops::OpenOptions;
-use axio::{PollState, SeekFrom};
+use axfs::OpenOptions;
+use axio::PollState;
 use axsync::Mutex;
 
 use super::fd_ops::{FileLike, get_file_like};
 use crate::{ctypes, utils::char_ptr_to_str};
 
 pub struct File {
-    inner: Mutex<axfs::fops::File>,
+    inner: Mutex<axfs::File>,
+    offset: Mutex<u64>,
 }
 
 impl File {
-    fn new(inner: axfs::fops::File) -> Self {
+    fn new(inner: axfs::File) -> Self {
         Self {
             inner: Mutex::new(inner),
+            offset: Mutex::new(0),
         }
     }
 
@@ -34,17 +36,32 @@ impl File {
 
 impl FileLike for File {
     fn read(&self, buf: &mut [u8]) -> LinuxResult<usize> {
-        Ok(self.inner.lock().read(buf)?)
+        let inner = self.inner.lock();
+        let mut offset = self.offset.lock();
+        let n = inner.read_at(buf, *offset)?;
+        *offset += n as u64;
+        Ok(n)
     }
 
     fn write(&self, buf: &[u8]) -> LinuxResult<usize> {
-        Ok(self.inner.lock().write(buf)?)
+        let inner = self.inner.lock();
+        if inner.flags().contains(axfs::FileFlags::APPEND) {
+            // In append mode, writes always go to the end regardless of fd offset.
+            let n = inner.write(buf)?;
+            *self.offset.lock() = inner.location().len()?;
+            Ok(n)
+        } else {
+            let mut offset = self.offset.lock();
+            let n = inner.write_at(buf, *offset)?;
+            *offset += n as u64;
+            Ok(n)
+        }
     }
 
     fn stat(&self) -> LinuxResult<ctypes::stat> {
-        let metadata = self.inner.lock().get_attr()?;
-        let ty = metadata.file_type() as u8;
-        let perm = metadata.perm().bits() as u32;
+        let metadata = self.inner.lock().location().metadata()?;
+        let ty = metadata.node_type as u8;
+        let perm = metadata.mode.bits() as u32;
         let st_mode = ((ty as u32) << 12) | perm;
         Ok(ctypes::stat {
             st_ino: 1,
@@ -52,8 +69,8 @@ impl FileLike for File {
             st_mode,
             st_uid: 1000,
             st_gid: 1000,
-            st_size: metadata.size() as _,
-            st_blocks: metadata.blocks() as _,
+            st_size: metadata.size as _,
+            st_blocks: metadata.blocks as _,
             st_blksize: 512,
             ..Default::default()
         })
@@ -80,8 +97,12 @@ fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;
     let mut options = OpenOptions::new();
     match flags & 0b11 {
-        ctypes::O_RDONLY => options.read(true),
-        ctypes::O_WRONLY => options.write(true),
+        ctypes::O_RDONLY => {
+            options.read(true);
+        }
+        ctypes::O_WRONLY => {
+            options.write(true);
+        }
         _ => {
             options.read(true);
             options.write(true);
@@ -111,7 +132,10 @@ pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> 
     debug!("sys_open <= {:?} {:#o} {:#o}", filename, flags, mode);
     syscall_body!(sys_open, {
         let options = flags_to_options(flags, mode);
-        let file = axfs::fops::File::open(filename?, &options)?;
+        let filename = filename?;
+        let file = options
+            .open(&axfs::FS_CONTEXT.lock(), filename)
+            .and_then(axfs::OpenResult::into_file)?;
         File::new(file).add_to_fd_table()
     })
 }
@@ -122,14 +146,27 @@ pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> 
 pub fn sys_lseek(fd: c_int, offset: ctypes::off_t, whence: c_int) -> ctypes::off_t {
     debug!("sys_lseek <= {} {} {}", fd, offset, whence);
     syscall_body!(sys_lseek, {
-        let pos = match whence {
-            0 => SeekFrom::Start(offset as _),
-            1 => SeekFrom::Current(offset as _),
-            2 => SeekFrom::End(offset as _),
-            _ => return Err(LinuxError::EINVAL),
-        };
-        let off = File::from_fd(fd)?.inner.lock().seek(pos)?;
-        Ok(off)
+        let file = File::from_fd(fd)?;
+        let new_offset: u64 = match whence {
+            0 => {
+                if offset < 0 {
+                    Err(LinuxError::EINVAL)
+                } else {
+                    Ok(offset as u64)
+                }
+            }
+            1 => {
+                let cur = *file.offset.lock();
+                cur.checked_add_signed(offset).ok_or(LinuxError::EINVAL)
+            }
+            2 => {
+                let end = file.inner.lock().location().len()?;
+                end.checked_add_signed(offset).ok_or(LinuxError::EINVAL)
+            }
+            _ => Err(LinuxError::EINVAL),
+        }?;
+        *file.offset.lock() = new_offset;
+        Ok(new_offset as ctypes::off_t)
     })
 }
 
@@ -143,9 +180,12 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
+        let path = path?;
         let mut options = OpenOptions::new();
         options.read(true);
-        let file = axfs::fops::File::open(path?, &options)?;
+        let file = options
+            .open(&axfs::FS_CONTEXT.lock(), path)
+            .and_then(axfs::OpenResult::into_file)?;
         let st = File::new(file).stat()?;
         unsafe { *buf = st };
         Ok(0)
@@ -191,7 +231,7 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
             return Ok(core::ptr::null::<c_char>() as _);
         }
         let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size as _) };
-        let cwd = axfs::api::current_dir()?;
+        let cwd = axfs::FS_CONTEXT.lock().current_dir().absolute_path()?;
         let cwd = cwd.as_bytes();
         if cwd.len() < size {
             dst[..cwd.len()].copy_from_slice(cwd);
@@ -212,7 +252,7 @@ pub fn sys_rename(old: *const c_char, new: *const c_char) -> c_int {
         let old_path = char_ptr_to_str(old)?;
         let new_path = char_ptr_to_str(new)?;
         debug!("sys_rename <= old: {:?}, new: {:?}", old_path, new_path);
-        axfs::api::rename(old_path, new_path)?;
+        axfs::FS_CONTEXT.lock().rename(old_path, new_path)?;
         Ok(0)
     })
 }
