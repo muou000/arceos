@@ -95,6 +95,11 @@ pub fn kernel_page_table_root() -> PhysAddr {
     KERNEL_ASPACE.lock().page_table_root()
 }
 
+/// Increase mapping refcount for a shared frame used by fork COW.
+pub fn cow_inc_frame_ref(frame: PhysAddr) {
+    backend::cow_inc_frame_ref(frame);
+}
+
 /// Initializes virtual memory management.
 ///
 /// It mainly sets up the kernel virtual memory address space and recreate a

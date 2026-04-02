@@ -244,6 +244,23 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Remap a single 4K page to a specified physical frame.
+    pub fn remap_page(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MappingFlags) -> AxResult {
+        if !self.contains_range(vaddr, PAGE_SIZE_4K) {
+            return ax_err!(InvalidInput, "address out of range");
+        }
+        if !vaddr.is_aligned_4k() || !paddr.is_aligned_4k() {
+            return ax_err!(InvalidInput, "address not aligned");
+        }
+
+        self.pt
+            .remap(vaddr, paddr, flags)
+            .map_err(|_| AxError::BadState)?
+            .1
+            .flush();
+        Ok(())
+    }
+
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
         self.areas.clear(&mut self.pt).unwrap();

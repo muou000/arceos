@@ -1,9 +1,35 @@
+use alloc::collections::BTreeMap;
 use axalloc::global_allocator;
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use axhal::paging::{MappingFlags, PageSize, PageTable};
-use memory_addr::{PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr};
+use kspin::SpinNoIrq;
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr};
 
 use super::Backend;
+
+static FRAME_REFS: SpinNoIrq<BTreeMap<usize, usize>> = SpinNoIrq::new(BTreeMap::new());
+
+pub(crate) fn cow_inc_frame_ref(frame: PhysAddr) {
+    let key = frame.as_usize();
+    let mut refs = FRAME_REFS.lock();
+    refs.entry(key).and_modify(|c| *c += 1).or_insert(2);
+}
+
+fn drop_frame_mapping_ref(frame: PhysAddr) -> bool {
+    let key = frame.as_usize();
+    let mut refs = FRAME_REFS.lock();
+    match refs.get_mut(&key) {
+        Some(cnt) if *cnt > 1 => {
+            *cnt -= 1;
+            false
+        }
+        Some(_) => {
+            refs.remove(&key);
+            true
+        }
+        None => true,
+    }
+}
 
 fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
     let vaddr = VirtAddr::from(global_allocator().alloc_pages(1, PAGE_SIZE_4K).ok()?);
@@ -15,6 +41,9 @@ fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
 }
 
 fn dealloc_frame(frame: PhysAddr) {
+    if !drop_frame_mapping_ref(frame) {
+        return;
+    }
     let vaddr = phys_to_virt(frame);
     global_allocator().dealloc_pages(vaddr.as_usize(), 1);
 }
@@ -92,8 +121,50 @@ impl Backend {
         pt: &mut PageTable,
         populate: bool,
     ) -> bool {
-        if populate {
-            false // Populated mappings should not trigger page faults.
+        if let Ok((old_frame, old_flags, _)) = pt.query(vaddr.align_down_4k()) {
+            // Lazy anonymous mappings install an empty placeholder PTE first.
+            // Their first access should allocate a fresh zeroed frame rather
+            // than taking the COW path.
+            if old_flags.is_empty() {
+                if populate {
+                    return false;
+                }
+                if let Some(frame) = alloc_frame(true) {
+                    return pt
+                        .remap(vaddr, frame, orig_flags)
+                        .map(|(_, tlb)| tlb.flush())
+                        .is_ok();
+                }
+                return false;
+            }
+
+            if orig_flags.contains(MappingFlags::WRITE) && !old_flags.contains(MappingFlags::WRITE) {
+                if let Some(new_frame) = alloc_frame(false) {
+                    let src = phys_to_virt(old_frame).as_ptr() as *const u8;
+                    let dst = phys_to_virt(new_frame).as_mut_ptr() as *mut u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE_4K);
+                    }
+
+                    if pt
+                        .remap(vaddr, new_frame, orig_flags)
+                        .map(|(_, tlb)| tlb.flush())
+                        .is_ok()
+                    {
+                        dealloc_frame(old_frame);
+                        true
+                    } else {
+                        dealloc_frame(new_frame);
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else if populate {
+            false
         } else if let Some(frame) = alloc_frame(true) {
             // Allocate a physical frame lazily and map it to the fault address.
             // `vaddr` does not need to be aligned. It will be automatically

@@ -7,6 +7,8 @@ use memory_set::MappingBackend;
 mod alloc;
 mod linear;
 
+pub(crate) use alloc::cow_inc_frame_ref;
+
 /// A unified enum type for different memory mapping backends.
 ///
 /// Currently, two backends are implemented:
