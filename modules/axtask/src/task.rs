@@ -155,6 +155,14 @@ impl TaskInner {
         Some(self.exit_code.load(Ordering::Acquire))
     }
 
+    pub fn try_join(&self) -> Option<i32> {
+        if self.state() == TaskState::Exited {
+            Some(self.exit_code.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
     /// Returns the pointer to the user-defined task extended data.
     ///
     /// # Safety
