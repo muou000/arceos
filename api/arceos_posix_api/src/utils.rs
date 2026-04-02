@@ -35,7 +35,7 @@ macro_rules! syscall_body {
         #[allow(clippy::redundant_closure_call)]
         let res = (|| -> axerrno::LinuxResult<_> { $($stmt)* })();
         match res {
-            Ok(_) | Err(axerrno::LinuxError::EAGAIN) => debug!(concat!(stringify!($fn), " => {:?}"),  res),
+            Ok(_) | Err(axerrno::LinuxError::EAGAIN) | Err(axerrno::LinuxError::ENOENT) => debug!(concat!(stringify!($fn), " => {:?}"),  res),
             Err(_) => info!(concat!(stringify!($fn), " => {:?}"), res),
         }
         match res {

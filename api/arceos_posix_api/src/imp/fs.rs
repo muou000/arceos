@@ -92,6 +92,117 @@ impl FileLike for File {
     }
 }
 
+pub struct DirFile {
+    inner: Mutex<axfs::OpenResult>,
+    offset: Mutex<u64>,
+}
+
+impl DirFile {
+    fn new(dir: axfs::OpenResult) -> Self {
+        Self {
+            inner: Mutex::new(dir),
+            offset: Mutex::new(0),
+        }
+    }
+    fn from_fd(fd: c_int) -> LinuxResult<Arc<Self>> {
+        let f = super::fd_ops::get_file_like(fd)?;
+        f.into_any()
+            .downcast::<Self>()
+            .map_err(|_| LinuxError::EBADF)
+    }
+}
+
+impl FileLike for DirFile {
+    fn read(&self, _buf: &mut [u8]) -> LinuxResult<usize> {
+        Err(LinuxError::EISDIR)
+    }
+    fn write(&self, _buf: &[u8]) -> LinuxResult<usize> {
+        Err(LinuxError::EBADF)
+    }
+    fn stat(&self) -> LinuxResult<ctypes::stat> {
+        let inner = self.inner.lock();
+        if let axfs::OpenResult::Dir(dir) = &*inner {
+            let metadata = dir.metadata()?;
+            let ty = metadata.node_type as u8;
+            let perm = metadata.mode.bits() as u32;
+            let st_mode = ((ty as u32) << 12) | perm;
+            Ok(ctypes::stat {
+                st_ino: 1,
+                st_nlink: 1,
+                st_mode,
+                st_uid: 1000,
+                st_gid: 1000,
+                st_size: metadata.size as _,
+                st_blocks: metadata.blocks as _,
+                st_blksize: 512,
+                ..Default::default()
+            })
+        } else {
+            Err(LinuxError::EBADF)
+        }
+    }
+    fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
+        self
+    }
+    fn poll(&self) -> LinuxResult<PollState> {
+        Ok(PollState { readable: true, writable: false })
+    }
+    fn set_nonblocking(&self, _nonblocking: bool) -> LinuxResult {
+        Ok(())
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug)]
+pub struct LinuxDirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+}
+
+pub unsafe fn sys_getdents64(fd: c_int, dirp: *mut u8, count: usize) -> c_int {
+    debug!("sys_getdents64 <= {} {:#x} {}", fd, dirp as usize, count);
+    syscall_body!(sys_getdents64, {
+        let dirfile = DirFile::from_fd(fd)?;
+        let mut offset = dirfile.offset.lock();
+        let mut written = 0;
+        let inner = dirfile.inner.lock();
+        if let axfs::OpenResult::Dir(dir) = &*inner {
+            let mut break_out = false;
+            let res = dir.read_dir(*offset, &mut |name: &str, ino: u64, node_type: axfs::NodeType, next_off: u64| -> bool {
+                if break_out { return false; }
+                let name_bytes = name.as_bytes();
+                let name_len = name_bytes.len();
+                let unpadded_len = core::mem::size_of::<LinuxDirent64>() + name_len + 1;
+                let reclen = (unpadded_len + 7) & !7;
+                if written + reclen > count {
+                    break_out = true;
+                    return false;
+                }
+                let d_type = node_type as u8;
+                let dst = unsafe { dirp.add(written) };
+                let dirent = LinuxDirent64 { d_ino: ino, d_off: next_off as i64, d_reclen: reclen as u16, d_type };
+                unsafe {
+                    core::ptr::write_unaligned(dst as *mut LinuxDirent64, dirent);
+                    let name_dst = dst.add(core::mem::size_of::<LinuxDirent64>());
+                    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dst, name_len);
+                    core::ptr::write_bytes(name_dst.add(name_len), 0, reclen - core::mem::size_of::<LinuxDirent64>() - name_len);
+                }
+                written += reclen;
+                *offset = next_off;
+                true
+            });
+            if let Err(e) = res {
+                if written == 0 { return Err(e.into()); }
+            }
+            Ok(written as c_int)
+        } else {
+            Err(LinuxError::EBADF)
+        }
+    })
+}
+
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;
@@ -133,10 +244,12 @@ pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> 
     syscall_body!(sys_open, {
         let options = flags_to_options(flags, mode);
         let filename = filename?;
-        let file = options
-            .open(&axfs::FS_CONTEXT.lock(), filename)
-            .and_then(axfs::OpenResult::into_file)?;
-        File::new(file).add_to_fd_table()
+        let result = options.open(&axfs::FS_CONTEXT.lock(), filename)?;
+        let f: Arc<dyn FileLike> = match result {
+            axfs::OpenResult::File(file) => Arc::new(File::new(file)),
+            dir_res @ axfs::OpenResult::Dir(_) => Arc::new(DirFile::new(dir_res)),
+        };
+        super::fd_ops::add_file_like(f)
     })
 }
 
@@ -183,10 +296,11 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         let path = path?;
         let mut options = OpenOptions::new();
         options.read(true);
-        let file = options
-            .open(&axfs::FS_CONTEXT.lock(), path)
-            .and_then(axfs::OpenResult::into_file)?;
-        let st = File::new(file).stat()?;
+        let opened = options.open(&axfs::FS_CONTEXT.lock(), path)?;
+        let st = match opened {
+            axfs::OpenResult::File(file) => File::new(file).stat()?,
+            axfs::OpenResult::Dir(dir) => DirFile::new(axfs::OpenResult::Dir(dir)).stat()?,
+        };
         unsafe { *buf = st };
         Ok(0)
     })
@@ -240,6 +354,19 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
         } else {
             Err(LinuxError::ERANGE)
         }
+    })
+}
+
+/// Set the current working directory.
+pub fn sys_chdir(path: *const c_char) -> c_int {
+    let path = char_ptr_to_str(path);
+    debug!("sys_chdir <= {:?}", path);
+    syscall_body!(sys_chdir, {
+        let path = path?;
+        let mut fs = axfs::FS_CONTEXT.lock();
+        let dir = fs.resolve(path)?;
+        fs.set_current_dir(dir)?;
+        Ok(0)
     })
 }
 

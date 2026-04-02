@@ -11,6 +11,7 @@ use alloc::{format, string::String, vec::Vec};
 
 use axdriver::{AxBlockDevice, AxDeviceContainer, prelude::*};
 use axfs_ng_vfs::NodePermission;
+pub use axfs_ng_vfs::NodeType;
 
 #[cfg(feature = "fat")]
 mod disk;
