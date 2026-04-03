@@ -27,7 +27,7 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
         disk_idx: usize,
         dev_name: String,
         fs: axfs_ng_vfs::Filesystem,
-        has_busybox: bool,
+        has_shell: bool,
     }
 
     let mut candidates: Vec<FsCandidate> = Vec::new();
@@ -51,27 +51,31 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
 
         let probe_mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
         let probe_cx = FsContext::new(probe_mp.root_location());
-        let has_busybox = probe_cx.metadata("/bin/busybox").is_ok();
+        let has_shell = probe_cx.metadata("/bin/sh").is_ok();
 
         info!(
-            "  filesystem on device {}: {} (busybox={})",
+            "  filesystem on device {}: {} (sh={})",
             disk_idx,
             fs.name(),
-            has_busybox
+            has_shell,
         );
 
         candidates.push(FsCandidate {
             disk_idx,
             dev_name,
             fs,
-            has_busybox,
+            has_shell,
         });
         disk_idx += 1;
     }
 
     assert!(!candidates.is_empty(), "No usable filesystem found!");
 
-    let root_pos = candidates.iter().position(|c| c.has_busybox).unwrap_or(0);
+    // Pick the most likely user rootfs first to avoid booting from test images.
+    let root_pos = candidates
+        .iter()
+        .position(|c| c.has_shell)
+        .unwrap_or(0);
     let root = candidates.swap_remove(root_pos);
     info!(
         "  select block device {} ({}) as root filesystem",
