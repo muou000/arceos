@@ -299,6 +299,16 @@ impl AddrSpace {
         false
     }
 
+    /// Visits all mapped virtual memory areas tracked by this address space.
+    pub fn for_each_area<F>(&self, mut f: F)
+    where
+        F: FnMut(VirtAddr, VirtAddr, MappingFlags),
+    {
+        for area in self.areas.iter() {
+            f(area.start(), area.end(), area.flags());
+        }
+    }
+
     /// Handles a page fault at the given address.
     ///
     /// `access_flags` indicates the access type that caused the page fault.

@@ -210,6 +210,14 @@ pub fn yield_now() {
     current_run_queue::<NoPreemptIrqSave>().yield_current()
 }
 
+/// Updates the saved page table root of the current task context.
+pub fn set_current_page_table_root(pt_root: memory_addr::PhysAddr) {
+    let curr = current();
+    unsafe {
+        (*curr.ctx_mut_ptr()).set_page_table_root(pt_root);
+    }
+}
+
 /// Current task is going to sleep for the given duration.
 ///
 /// If the feature `irq` is not enabled, it uses busy-wait instead.
