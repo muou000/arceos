@@ -69,28 +69,26 @@ pub fn sys_dup(old_fd: c_int) -> c_int {
 }
 
 /// Duplicate a file descriptor, but it uses the file descriptor number specified in `new_fd`.
-///
-/// TODO: `dup2` should forcibly close new_fd if it is already opened.
 pub fn sys_dup2(old_fd: c_int, new_fd: c_int) -> c_int {
     debug!("sys_dup2 <= old_fd: {}, new_fd: {}", old_fd, new_fd);
     syscall_body!(sys_dup2, {
         if old_fd == new_fd {
-            let r = sys_fcntl(old_fd, ctypes::F_GETFD as _, 0);
-            if r >= 0 {
-                return Ok(old_fd);
-            } else {
-                return Ok(r);
-            }
+            // POSIX: dup2(oldfd, oldfd) returns oldfd if it is valid.
+            get_file_like(old_fd)?;
+            return Ok(old_fd);
         }
-        if new_fd as usize >= AX_FILE_LIMIT {
+        if new_fd < 0 || new_fd as usize >= AX_FILE_LIMIT {
             return Err(LinuxError::EBADF);
         }
 
         let f = get_file_like(old_fd)?;
-        FD_TABLE
-            .write()
+        let mut table = FD_TABLE.write();
+        // POSIX: if newfd is already open, close it first.
+        let _ = table.remove(new_fd as usize);
+        table
             .add_at(new_fd as usize, f)
-            .map_err(|_| LinuxError::EMFILE)?;
+            // Out-of-range is checked above, and occupied slot is removed above.
+            .map_err(|_| LinuxError::EBADF)?;
 
         Ok(new_fd)
     })
