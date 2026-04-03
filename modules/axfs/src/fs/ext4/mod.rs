@@ -3,6 +3,7 @@ mod inode;
 mod util;
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 #[allow(unused_imports)]

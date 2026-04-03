@@ -55,13 +55,13 @@ impl FilesystemOps for Ext4Filesystem {
         let sb = &fs.super_block;
         Ok(StatFs {
             fs_type: 0xef53,
-            block_size: sb.block_size() as u64,
+            block_size: sb.block_size(),
             blocks: sb.blocks_count() as u64,
             blocks_free: sb.free_blocks_count(),
             blocks_available: sb.free_blocks_count(),
             file_count: sb.total_inodes() as u64,
             free_file_count: sb.free_inodes_count() as u64,
-            name_length: MAX_NAME_LEN as u64,
+            name_length: MAX_NAME_LEN as u32,
             fragment_size: 0,
             mount_flags: 0,
         })

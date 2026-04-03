@@ -1,5 +1,5 @@
-use alloc::{borrow::ToOwned, string::String, sync::Arc, vec};
-use core::{any::Any, task::Context};
+use alloc::{string::String, sync::Arc, vec};
+use core::{any::Any, task::Context, time::Duration};
 
 use axfs_ng_vfs::{
     DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, FilesystemOps, Metadata,
@@ -7,14 +7,11 @@ use axfs_ng_vfs::{
     WeakDirEntry,
 };
 use axpoll::{IoEvents, Pollable};
-use ext4_rs::{Errno, Ext4, Ext4DirEntry, Ext4DirSearchResult, Ext4InodeRef, FileAttr};
+use ext4_rs::Ext4;
 
 use super::{
     Ext4Filesystem,
-    util::{
-        duration_to_ext4_time, into_ext4_type, into_vfs_err, into_vfs_type, metadata_from_attr,
-        now_as_ext4_time,
-    },
+    util::{duration_to_ext4_time, into_ext4_type, into_vfs_err, into_vfs_type, now_as_ext4_time},
 };
 
 pub struct Inode {
@@ -28,42 +25,43 @@ impl Inode {
         Arc::new(Self { fs, ino, this })
     }
 
-    fn create_entry(&self, inode_ref: &Ext4InodeRef, name: impl Into<String>) -> DirEntry {
+    fn create_entry(
+        &self,
+        inode_num: u32,
+        node_type: NodeType,
+        is_dir: bool,
+        name: impl Into<String>,
+    ) -> DirEntry {
         let reference = Reference::new(
             self.this.as_ref().and_then(WeakDirEntry::upgrade),
             name.into(),
         );
-        let node_type = into_vfs_type(inode_ref.inode.file_type());
-        if inode_ref.inode.is_dir() {
+        if is_dir {
             DirEntry::new_dir(
-                |child_this| {
-                    DirNode::new(Inode::new(
-                        self.fs.clone(),
-                        inode_ref.inode_num,
-                        Some(child_this),
-                    ))
-                },
+                |child_this| DirNode::new(Inode::new(self.fs.clone(), inode_num, Some(child_this))),
                 reference,
             )
         } else {
             DirEntry::new_file(
-                FileNode::new(Inode::new(self.fs.clone(), inode_ref.inode_num, None)),
+                FileNode::new(Inode::new(self.fs.clone(), inode_num, None)),
                 node_type,
                 reference,
             )
         }
     }
 
-    fn inode_ref(&self, fs: &Ext4, ino: u32) -> Ext4InodeRef {
-        fs.get_inode_ref(ino)
+    fn find_inode_in_dir(&self, fs: &Ext4, dir_ino: u32, name: &str) -> Option<u32> {
+        fs.dir_get_entries(dir_ino)
+            .into_iter()
+            .find(|entry| entry.get_name() == name)
+            .map(|entry| entry.inode)
     }
 
-    fn lookup_locked(&self, fs: &mut Ext4, name: &str) -> VfsResult<DirEntry> {
-        let mut result = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        fs.dir_find_entry(self.ino, name, &mut result)
-            .map_err(into_vfs_err)?;
-        let inode_ref = self.inode_ref(fs, result.dentry.inode);
-        Ok(self.create_entry(&inode_ref, name))
+    fn dir_has_children(&self, fs: &Ext4, dir_ino: u32) -> bool {
+        fs.dir_get_entries(dir_ino).into_iter().any(|entry| {
+            let name = entry.get_name();
+            name != "." && name != ".."
+        })
     }
 }
 
@@ -74,9 +72,23 @@ impl NodeOps for Inode {
 
     fn metadata(&self) -> VfsResult<Metadata> {
         let fs = self.fs.lock();
-        let inode_ref = self.inode_ref(&fs, self.ino);
-        let attr = FileAttr::from_inode_ref(&inode_ref);
-        Ok(metadata_from_attr(&attr))
+        let inode_ref = fs.get_inode_ref(self.ino);
+        Ok(Metadata {
+            device: 0,
+            inode: inode_ref.inode_num as u64,
+            nlink: inode_ref.inode.links_count() as u64,
+            mode: NodePermission::from_bits_truncate(inode_ref.inode.file_perm().bits()),
+            node_type: into_vfs_type(inode_ref.inode.file_type()),
+            uid: inode_ref.inode.uid() as u32,
+            gid: inode_ref.inode.gid() as u32,
+            size: inode_ref.inode.size(),
+            block_size: ext4_rs::BLOCK_SIZE as u64,
+            blocks: inode_ref.inode.blocks_count(),
+            rdev: Default::default(),
+            atime: Duration::from_secs(inode_ref.inode.atime() as u64),
+            mtime: Duration::from_secs(inode_ref.inode.mtime() as u64),
+            ctime: Duration::from_secs(inode_ref.inode.ctime() as u64),
+        })
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
@@ -127,10 +139,25 @@ impl NodeOps for Inode {
 
 impl FileNodeOps for Inode {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        self.fs
-            .lock()
-            .read_at(self.ino, offset as usize, buf)
-            .map_err(into_vfs_err)
+        let fs = self.fs.lock();
+        let inode_ref = fs.get_inode_ref(self.ino);
+        if inode_ref.inode.is_link() && inode_ref.inode.blocks_count() == 0 {
+            let size = inode_ref.inode.size() as usize;
+            let offset = offset as usize;
+            if offset >= size {
+                return Ok(0);
+            }
+
+            let available = size - offset;
+            let len = available.min(buf.len());
+            let mut raw = [0u8; 15 * core::mem::size_of::<u32>()];
+            for (index, word) in inode_ref.inode.block().into_iter().enumerate() {
+                raw[index * 4..(index + 1) * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            buf[..len].copy_from_slice(&raw[offset..offset + len]);
+            return Ok(len);
+        }
+        fs.read_at(self.ino, offset as usize, buf).map_err(into_vfs_err)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -173,6 +200,26 @@ impl FileNodeOps for Inode {
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
+        let fs = self.fs.lock();
+        let mut inode_ref = fs.get_inode_ref(self.ino);
+        let bytes = target.as_bytes();
+        if bytes.len() <= 15 * core::mem::size_of::<u32>() {
+            let mut words = [0u32; 15];
+            for (index, chunk) in bytes.chunks(4).enumerate() {
+                let mut raw = [0u8; 4];
+                raw[..chunk.len()].copy_from_slice(chunk);
+                words[index] = u32::from_le_bytes(raw);
+            }
+
+            inode_ref.inode.set_block(words);
+            inode_ref.inode.set_size(bytes.len() as u64);
+            inode_ref.inode.set_blocks_count(0);
+            fs.write_back_inode(&mut inode_ref);
+            return Ok(());
+        }
+
+        drop(inode_ref);
+        drop(fs);
         self.set_len(0)?;
         self.fs
             .lock()
@@ -208,8 +255,17 @@ impl DirNodeOps for Inode {
     }
 
     fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
-        let mut fs = self.fs.lock();
-        self.lookup_locked(&mut fs, name)
+        let fs = self.fs.lock();
+        let inode_num = self
+            .find_inode_in_dir(&fs, self.ino, name)
+            .ok_or(VfsError::NotFound)?;
+        let inode_ref = fs.get_inode_ref(inode_num);
+        Ok(self.create_entry(
+            inode_ref.inode_num,
+            into_vfs_type(inode_ref.inode.file_type()),
+            inode_ref.inode.is_dir(),
+            name,
+        ))
     }
 
     fn create(
@@ -219,19 +275,23 @@ impl DirNodeOps for Inode {
         permission: NodePermission,
     ) -> VfsResult<DirEntry> {
         let inode_type = into_ext4_type(node_type)?;
-        let mut fs = self.fs.lock();
-        let mut existing = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        if fs.dir_find_entry(self.ino, name, &mut existing).is_ok() {
+        let fs = self.fs.lock();
+        if self.find_inode_in_dir(&fs, self.ino, name).is_some() {
             return Err(VfsError::AlreadyExists);
         }
         let inode_ref = fs
             .create(self.ino, name, inode_type.bits() | permission.bits())
             .map_err(into_vfs_err)?;
-        Ok(self.create_entry(&inode_ref, name))
+        Ok(self.create_entry(
+            inode_ref.inode_num,
+            node_type,
+            node_type == NodeType::Directory,
+            name,
+        ))
     }
 
     fn link(&self, name: &str, node: &DirEntry) -> VfsResult<DirEntry> {
-        let mut fs = self.fs.lock();
+        let fs = self.fs.lock();
         let mut parent = fs.get_inode_ref(self.ino);
         let mut child = fs.get_inode_ref(node.inode() as u32);
         fs.link(&mut parent, &mut child, name)
@@ -239,18 +299,23 @@ impl DirNodeOps for Inode {
         fs.write_back_inode(&mut parent);
         fs.write_back_inode(&mut child);
         let linked = fs.get_inode_ref(child.inode_num);
-        Ok(self.create_entry(&linked, name))
+        Ok(self.create_entry(
+            linked.inode_num,
+            into_vfs_type(linked.inode.file_type()),
+            linked.inode.is_dir(),
+            name,
+        ))
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
         let fs = self.fs.lock();
-        let mut result = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        fs.dir_find_entry(self.ino, name, &mut result)
-            .map_err(into_vfs_err)?;
+        let inode_num = self
+            .find_inode_in_dir(&fs, self.ino, name)
+            .ok_or(VfsError::NotFound)?;
         let mut parent = fs.get_inode_ref(self.ino);
-        let mut child = fs.get_inode_ref(result.dentry.inode);
-        if child.inode.is_dir() && fs.dir_has_entry(child.inode_num) {
-            return Err(VfsError::ENOTEMPTY);
+        let mut child = fs.get_inode_ref(inode_num);
+        if child.inode.is_dir() && self.dir_has_children(&fs, child.inode_num) {
+            return Err(VfsError::DirectoryNotEmpty);
         }
         if child.inode.links_count() == 1 && child.inode.size() > 0 {
             fs.truncate_inode(&mut child, 0).map_err(into_vfs_err)?;
@@ -264,39 +329,35 @@ impl DirNodeOps for Inode {
         let dst_dir: Arc<Self> = dst_dir.downcast().map_err(|_| VfsError::InvalidInput)?;
         let fs = self.fs.lock();
 
-        let mut src_search = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        fs.dir_find_entry(self.ino, src_name, &mut src_search)
-            .map_err(into_vfs_err)?;
-        let src_inode = fs.get_inode_ref(src_search.dentry.inode);
+        let src_inode_num = self
+            .find_inode_in_dir(&fs, self.ino, src_name)
+            .ok_or(VfsError::NotFound)?;
+        let src_inode = fs.get_inode_ref(src_inode_num);
 
-        let mut dst_existing = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        match fs.dir_find_entry(dst_dir.ino, dst_name, &mut dst_existing) {
-            Ok(_) => {
-                if dst_existing.dentry.inode == src_inode.inode_num {
-                    return Ok(());
-                }
-                let mut dst_parent = fs.get_inode_ref(dst_dir.ino);
-                let mut dst_inode = fs.get_inode_ref(dst_existing.dentry.inode);
-                if dst_inode.inode.is_dir() && fs.dir_has_entry(dst_inode.inode_num) {
-                    return Err(VfsError::ENOTEMPTY);
-                }
-                if dst_inode.inode.links_count() == 1 && dst_inode.inode.size() > 0 {
-                    fs.truncate_inode(&mut dst_inode, 0).map_err(into_vfs_err)?;
-                }
-                fs.unlink(&mut dst_parent, &mut dst_inode, dst_name)
-                    .map_err(into_vfs_err)?;
+        if src_inode.inode.is_dir() && self.ino != dst_dir.ino {
+            return Err(VfsError::OperationNotSupported);
+        }
+
+        if let Some(dst_inode_num) = self.find_inode_in_dir(&fs, dst_dir.ino, dst_name) {
+            if dst_inode_num == src_inode.inode_num {
+                return Ok(());
             }
-            Err(err) if err.error() == Errno::ENOENT => {}
-            Err(err) => return Err(into_vfs_err(err)),
+
+            let mut dst_parent = fs.get_inode_ref(dst_dir.ino);
+            let mut dst_inode = fs.get_inode_ref(dst_inode_num);
+            if dst_inode.inode.is_dir() && self.dir_has_children(&fs, dst_inode.inode_num) {
+                return Err(VfsError::DirectoryNotEmpty);
+            }
+            if dst_inode.inode.links_count() == 1 && dst_inode.inode.size() > 0 {
+                fs.truncate_inode(&mut dst_inode, 0).map_err(into_vfs_err)?;
+            }
+            fs.unlink(&mut dst_parent, &mut dst_inode, dst_name)
+                .map_err(into_vfs_err)?;
         }
 
         let mut dst_parent = fs.get_inode_ref(dst_dir.ino);
         fs.dir_add_entry(&mut dst_parent, &src_inode, dst_name)
             .map_err(into_vfs_err)?;
-
-        if src_inode.inode.is_dir() && self.ino != dst_dir.ino {
-            return Err(VfsError::OperationNotSupported);
-        }
 
         fs.write_back_inode(&mut dst_parent);
 

@@ -1,8 +1,8 @@
 use core::time::Duration;
 
 use axerrno::LinuxError;
-use axfs_ng_vfs::{Metadata, NodePermission, NodeType, VfsError};
-use ext4_rs::{Ext4Error, Ext4InodeRef, FileAttr, InodeFileType};
+use axfs_ng_vfs::{NodeType, VfsError};
+use ext4_rs::{Ext4Error, InodeFileType};
 
 pub fn into_vfs_err(err: Ext4Error) -> VfsError {
     let linux_error = LinuxError::try_from(err.error() as i32).unwrap_or(LinuxError::EIO);
@@ -33,29 +33,6 @@ pub fn into_ext4_type(ty: NodeType) -> Result<InodeFileType, VfsError> {
         NodeType::Socket => InodeFileType::S_IFSOCK,
         NodeType::Unknown => return Err(VfsError::InvalidData),
     })
-}
-
-pub fn metadata_from_attr(attr: &FileAttr) -> Metadata {
-    Metadata {
-        inode: attr.ino,
-        device: 0,
-        nlink: attr.nlink as u64,
-        mode: NodePermission::from_bits_truncate(attr.perm.bits()),
-        node_type: into_vfs_type(attr.kind),
-        uid: attr.uid,
-        gid: attr.gid,
-        size: attr.size,
-        block_size: attr.blksize as u64,
-        blocks: attr.blocks,
-        rdev: Default::default(),
-        atime: Duration::from_secs(attr.atime as u64),
-        mtime: Duration::from_secs(attr.mtime as u64),
-        ctime: Duration::from_secs(attr.ctime as u64),
-    }
-}
-
-pub fn metadata_from_inode_ref(inode_ref: &Ext4InodeRef) -> Metadata {
-    metadata_from_attr(&FileAttr::from_inode_ref(inode_ref))
 }
 
 pub fn duration_to_ext4_time(value: Duration) -> u32 {
