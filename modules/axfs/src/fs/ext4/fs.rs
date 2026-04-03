@@ -5,38 +5,34 @@ use axdriver::AxBlockDevice;
 use axfs_ng_vfs::{
     DirEntry, DirNode, Filesystem, FilesystemOps, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
 };
+use ext4_rs::Ext4;
 use kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
-use lwext4_rust::{FsConfig, ffi::EXT4_ROOT_INO};
 
-use super::{
-    Ext4Disk, Inode,
-    util::{LwExt4Filesystem, into_vfs_err},
-};
+use super::{Ext4Disk, Inode};
 
-const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
+const ROOT_INODE: u32 = 2;
 
 pub struct Ext4Filesystem {
-    inner: Mutex<LwExt4Filesystem>,
+    inner: Mutex<Ext4>,
     root_dir: OnceCell<DirEntry>,
 }
 
 impl Ext4Filesystem {
     pub fn new(dev: AxBlockDevice) -> VfsResult<Filesystem> {
-        let ext4 =
-            lwext4_rust::Ext4Filesystem::new(Ext4Disk(dev), EXT4_CONFIG).map_err(into_vfs_err)?;
-
+        let disk = Ext4Disk::new(dev);
+        let ext4 = Ext4::open(disk);
         let fs = Arc::new(Self {
             inner: Mutex::new(ext4),
             root_dir: OnceCell::new(),
         });
         let _ = fs.root_dir.set(DirEntry::new_dir(
-            |this| DirNode::new(Inode::new(fs.clone(), EXT4_ROOT_INO, Some(this))),
+            |this| DirNode::new(Inode::new(fs.clone(), ROOT_INODE, Some(this))),
             Reference::root(),
         ));
         Ok(Filesystem::new(fs))
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, LwExt4Filesystem> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Ext4> {
         self.inner.lock()
     }
 }
@@ -55,25 +51,23 @@ impl FilesystemOps for Ext4Filesystem {
     }
 
     fn stat(&self) -> VfsResult<StatFs> {
-        let mut fs = self.lock();
-        let stat = fs.stat().map_err(into_vfs_err)?;
+        let fs = self.lock();
+        let sb = &fs.super_block;
         Ok(StatFs {
             fs_type: 0xef53,
-            block_size: stat.block_size as _,
-            blocks: stat.blocks_count,
-            blocks_free: stat.free_blocks_count,
-            blocks_available: stat.free_blocks_count,
-
-            file_count: stat.inodes_count as _,
-            free_file_count: stat.free_inodes_count as _,
-
-            name_length: MAX_NAME_LEN as _,
+            block_size: sb.block_size() as u64,
+            blocks: sb.blocks_count() as u64,
+            blocks_free: sb.free_blocks_count(),
+            blocks_available: sb.free_blocks_count(),
+            file_count: sb.total_inodes() as u64,
+            free_file_count: sb.free_inodes_count() as u64,
+            name_length: MAX_NAME_LEN as u64,
             fragment_size: 0,
             mount_flags: 0,
         })
     }
 
     fn flush(&self) -> VfsResult<()> {
-        self.inner.lock().flush().map_err(into_vfs_err)
+        Ok(())
     }
 }
