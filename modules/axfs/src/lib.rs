@@ -51,7 +51,7 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
 
         let probe_mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
         let probe_cx = FsContext::new(probe_mp.root_location());
-        let has_busybox = probe_cx.read("/bin/busybox").is_ok();
+        let has_busybox = probe_cx.metadata("/bin/busybox").is_ok();
 
         info!(
             "  filesystem on device {}: {} (busybox={})",
