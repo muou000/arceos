@@ -224,29 +224,6 @@ impl AddrSpace {
         })
     }
 
-   /// Updates mapping within the specified virtual address range.
-    ///
-    /// Returns an error if the address range is out of the address space or not
-    /// aligned.
-    pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
-        if size == 0 {
-            return Ok(());
-        }
-        if !self.contains_range(start, size) {
-            return ax_err!(InvalidInput, "address out of range");
-        }
-        if !start.is_aligned_4k() || !is_aligned_4k(size) {
-            return ax_err!(InvalidInput, "address not aligned");
-        }
-
-        // TODO
-        self.pt
-            .protect_region(start, size, flags, true)
-            .map_err(|_| AxError::BadState)?
-            .ignore();
-        Ok(())
-    }
-
     /// Updates mapping within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not
