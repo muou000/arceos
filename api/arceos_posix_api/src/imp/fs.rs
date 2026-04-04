@@ -170,8 +170,14 @@ pub unsafe fn sys_getdents64(fd: c_int, dirp: *mut u8, count: usize) -> c_int {
         let inner = dirfile.inner.lock();
         if let axfs::OpenResult::Dir(dir) = &*inner {
             let mut break_out = false;
-            let res = dir.read_dir(*offset, &mut |name: &str, ino: u64, node_type: axfs::NodeType, next_off: u64| -> bool {
-                if break_out { return false; }
+            let res = dir.read_dir(*offset, &mut |name: &str,
+                                                  ino: u64,
+                                                  node_type: axfs::NodeType,
+                                                  next_off: u64|
+             -> bool {
+                if break_out {
+                    return false;
+                }
                 let name_bytes = name.as_bytes();
                 let name_len = name_bytes.len();
                 let unpadded_len = core::mem::size_of::<LinuxDirent64>() + name_len + 1;
@@ -182,19 +188,30 @@ pub unsafe fn sys_getdents64(fd: c_int, dirp: *mut u8, count: usize) -> c_int {
                 }
                 let d_type = node_type as u8;
                 let dst = unsafe { dirp.add(written) };
-                let dirent = LinuxDirent64 { d_ino: ino, d_off: next_off as i64, d_reclen: reclen as u16, d_type };
+                let dirent = LinuxDirent64 {
+                    d_ino: ino,
+                    d_off: next_off as i64,
+                    d_reclen: reclen as u16,
+                    d_type,
+                };
                 unsafe {
                     core::ptr::write_unaligned(dst as *mut LinuxDirent64, dirent);
                     let name_dst = dst.add(core::mem::size_of::<LinuxDirent64>());
                     core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dst, name_len);
-                    core::ptr::write_bytes(name_dst.add(name_len), 0, reclen - core::mem::size_of::<LinuxDirent64>() - name_len);
+                    core::ptr::write_bytes(
+                        name_dst.add(name_len),
+                        0,
+                        reclen - core::mem::size_of::<LinuxDirent64>() - name_len,
+                    );
                 }
                 written += reclen;
                 *offset = next_off;
                 true
             });
             if let Err(e) = res {
-                if written == 0 { return Err(e.into()); }
+                if written == 0 {
+                    return Err(e.into());
+                }
             }
             Ok(written as c_int)
         } else {

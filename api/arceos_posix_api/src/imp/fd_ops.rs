@@ -95,8 +95,6 @@ pub fn sys_dup2(old_fd: c_int, new_fd: c_int) -> c_int {
 }
 
 /// Manipulate file descriptor.
-///
-/// TODO: `SET/GET` command is ignored, hard-code stdin/stdout
 pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
     debug!("sys_fcntl <= fd: {} cmd: {} arg: {}", fd, cmd, arg);
     syscall_body!(sys_fcntl, {
@@ -105,6 +103,17 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
             ctypes::F_DUPFD_CLOEXEC => {
                 // TODO: Change fd flags
                 dup_fd(fd)
+            }
+            ctypes::F_GETFD => {
+                get_file_like(fd)?;
+                Ok(0)
+            }
+            ctypes::F_SETFD => {
+                // We currently do not track per-fd close-on-exec state, but
+                // musl expects this command to succeed during startup.
+                let _ = arg & (ctypes::FD_CLOEXEC as usize);
+                get_file_like(fd)?;
+                Ok(0)
             }
             ctypes::F_SETFL => {
                 if fd == 0 || fd == 1 || fd == 2 {

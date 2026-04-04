@@ -9,7 +9,7 @@ extern crate log;
 
 use alloc::{format, string::String, vec::Vec};
 
-use axdriver::{AxBlockDevice, AxDeviceContainer, prelude::*};
+use axdriver::{AxBlockDevice, AxDeviceContainer};
 use axfs_ng_vfs::NodePermission;
 pub use axfs_ng_vfs::NodeType;
 
