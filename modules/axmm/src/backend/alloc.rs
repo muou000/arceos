@@ -125,7 +125,11 @@ impl Backend {
             // Lazy anonymous mappings install an empty placeholder PTE first.
             // Their first access should allocate a fresh zeroed frame rather
             // than taking the COW path.
-            if old_flags.is_empty() {
+            //
+            // Note: mprotect() may update placeholder PTE flags before the
+            // first access, so `old_flags` can become non-empty while the
+            // backing frame is still absent (old_frame == 0).
+            if old_flags.is_empty() || old_frame.as_usize() == 0 {
                 if populate {
                     return false;
                 }

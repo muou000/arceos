@@ -224,11 +224,14 @@ impl AddrSpace {
         })
     }
 
-    /// Updates mapping within the specified virtual address range.
+   /// Updates mapping within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
         if !self.contains_range(start, size) {
             return ax_err!(InvalidInput, "address out of range");
         }
@@ -241,6 +244,33 @@ impl AddrSpace {
             .protect_region(start, size, flags, true)
             .map_err(|_| AxError::BadState)?
             .ignore();
+        Ok(())
+    }
+
+    /// Updates mapping within the specified virtual address range.
+    ///
+    /// Returns an error if the address range is out of the address space or not
+    /// aligned.
+    pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        if !self.contains_range(start, size) {
+            return ax_err!(InvalidInput, "address out of range");
+        }
+        if !start.is_aligned_4k() || !is_aligned_4k(size) {
+            return ax_err!(InvalidInput, "address not aligned");
+        }
+        if !self.can_access_range(start, size, MappingFlags::empty()) {
+            return ax_err!(BadAddress, "address not mapped");
+        }
+
+        // Update both page-table permissions and MemorySet area flags.
+        // Updating only page tables would make area metadata stale and break
+        // future permission checks (e.g. page fault validation).
+        self.areas
+            .protect(start, size, |_| Some(flags), &mut self.pt)
+            .map_err(mapping_err_to_ax_err)?;
         Ok(())
     }
 
@@ -317,15 +347,33 @@ impl AddrSpace {
     /// fault).
     pub fn handle_page_fault(&mut self, vaddr: VirtAddr, access_flags: PageFaultFlags) -> bool {
         if !self.va_range.contains(vaddr) {
+            debug!(
+                "handle_page_fault: vaddr={:#x} out of aspace range {:?}",
+                vaddr, self.va_range
+            );
             return false;
         }
         if let Some(area) = self.areas.find(vaddr) {
             let orig_flags = area.flags();
+            debug!(
+                "handle_page_fault: vaddr={:#x} in area [{:#x}, {:#x}) flags={:?}, access={:?}",
+                vaddr,
+                area.start(),
+                area.end(),
+                orig_flags,
+                access_flags
+            );
             if orig_flags.contains(access_flags) {
                 return area
                     .backend()
                     .handle_page_fault(vaddr, orig_flags, &mut self.pt);
             }
+            debug!(
+                "handle_page_fault: reject by permissions, area flags={:?}, access={:?}",
+                orig_flags, access_flags
+            );
+        } else {
+            debug!("handle_page_fault: no area found for vaddr={:#x}", vaddr);
         }
         false
     }
