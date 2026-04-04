@@ -251,6 +251,35 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Updates only page-table permissions within the specified range.
+    ///
+    /// Unlike [`Self::protect`], this does not change MemorySet area flags.
+    pub fn protect_pte_only(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+    ) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        if !self.contains_range(start, size) {
+            return ax_err!(InvalidInput, "address out of range");
+        }
+        if !start.is_aligned_4k() || !is_aligned_4k(size) {
+            return ax_err!(InvalidInput, "address not aligned");
+        }
+        if !self.can_access_range(start, size, MappingFlags::empty()) {
+            return ax_err!(BadAddress, "address not mapped");
+        }
+
+        self.pt
+            .protect_region(start, size, flags, true)
+            .map_err(|_| AxError::BadState)?
+            .ignore();
+        Ok(())
+    }
+
     /// Remap a single 4K page to a specified physical frame.
     pub fn remap_page(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MappingFlags) -> AxResult {
         if !self.contains_range(vaddr, PAGE_SIZE_4K) {
